@@ -1,0 +1,7 @@
+[package]
+name = "lockin-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lockin-proto = { path = "../lockin-proto" }

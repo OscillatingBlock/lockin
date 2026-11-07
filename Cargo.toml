@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "lockin-core",
+    "lockin-proto",
+    "lockin-server",
+    "lockin-client"
+]
+resolver = "2"
