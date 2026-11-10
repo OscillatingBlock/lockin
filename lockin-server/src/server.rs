@@ -6,7 +6,7 @@ use lockin_core::{
 };
 use lockin_proto::message::{
     ErrorCode, LockinRequest, LockinResponse, Message, NamespaceReadRequest, NamespaceRequest,
-    NamespaceWriteRequest,
+    NamespaceResponse, NamespaceWriteRequest,
 };
 use mini_raft::server::RaftNode;
 use std::sync::Arc;
@@ -72,46 +72,53 @@ impl LockinServer {
         }
     }
 
+    /// orchastrates response flow to the client
     async fn write_namespace(
         &self,
         conn_id: ConnectionId,
         write_req: NamespaceWriteRequest,
     ) -> anyhow::Result<()> {
+        let ns_response = self.try_namespace_write(write_req).await;
+
+        let msg = match ns_response {
+            Ok(response) => Message::Response(LockinResponse::Namespace(response)),
+            Err(e) => match self.raft_node.is_leader() {
+                true => Message::Response(LockinResponse::Error {
+                    code: ErrorCode::Internal,
+                    message: e.to_string(),
+                }),
+                false => Message::Response(LockinResponse::NotLeader { leader_hint: None }),
+            },
+        };
+
+        self.to_net
+            .send(ServerToNet { conn_id, msg })
+            .await
+            .context("failed to send response to client")
+    }
+
+    /// serializes write request , proposes write request to other nodes using raft, serialize raft
+    /// response into NamespaceResponse and return it
+    async fn try_namespace_write(
+        &self,
+        write_req: NamespaceWriteRequest,
+    ) -> anyhow::Result<NamespaceResponse> {
         let cmd = command_from_write(write_req);
         let cmd_bytes = bincode_next::serde::encode_to_vec(&cmd, bincode_next::config::standard())
             .context("failed to serialize command")?;
 
         match self.raft_node.propose(cmd_bytes).await {
-            Ok(response_bytes) => {
-                // apply_log encoded a CommandResponse
+            Ok(response) => {
                 let (cmd_resp, _): (CommandResponse, usize) =
                     bincode_next::serde::decode_from_slice(
-                        &response_bytes,
+                        &response,
                         bincode_next::config::standard(),
                     )
                     .context("failed to decode CommandResponse from raft")?;
 
-                let ns_res = namespace_response_from_command(cmd_resp);
-                let msg = Message::Response(LockinResponse::Namespace(ns_res));
-
-                self.to_net
-                    .send(ServerToNet { conn_id, msg })
-                    .await
-                    .context("failed to send write response to client")
+                Ok(namespace_response_from_command(cmd_resp))
             }
-            Err(e) => {
-                let msg = match self.raft_node.is_leader() {
-                    true => Message::Response(LockinResponse::Error {
-                        code: ErrorCode::Internal,
-                        message: e.to_string(),
-                    }),
-                    false => Message::Response(LockinResponse::NotLeader { leader_hint: None }),
-                };
-                self.to_net
-                    .send(ServerToNet { conn_id, msg })
-                    .await
-                    .context("failed to send error response to client")
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -120,6 +127,28 @@ impl LockinServer {
         id: ConnectionId,
         read_req: NamespaceReadRequest,
     ) -> anyhow::Result<()> {
+        let response_result = self.try_namespace_read(read_req).await;
+        let msg = match response_result {
+            Ok(response) => Message::Response(LockinResponse::Namespace(response)),
+            Err(e) => Message::Response(LockinResponse::Error {
+                code: ErrorCode::Internal,
+                message: e.to_string(),
+            }),
+        };
+        self.to_net
+            .send(ServerToNet {
+                conn_id: id,
+                msg: msg,
+            })
+            .await
+            .context("failed to send response to client")
+    }
+
+    /// parse read request , read state , return namespace response
+    async fn try_namespace_read(
+        &self,
+        read_req: NamespaceReadRequest,
+    ) -> anyhow::Result<NamespaceResponse> {
         let parsed_req = match read_req {
             NamespaceReadRequest::GetContents { id } => Query::GetContents {
                 id: NodeId::new(id),
@@ -129,15 +158,7 @@ impl LockinServer {
         let query_response = self
             .state_machine
             .read_state(parsed_req)
-            .context("failed to read state")?;
-        let ns_res = namespace_response_from_query(query_response);
-        let msg = LockinResponse::Namespace(ns_res);
-        self.to_net
-            .send(ServerToNet {
-                conn_id: id,
-                msg: Message::Response(msg),
-            })
-            .await
-            .context("failed to send response to client")
+            .context("failed to read namespace state")?;
+        Ok(namespace_response_from_query(query_response))
     }
 }
