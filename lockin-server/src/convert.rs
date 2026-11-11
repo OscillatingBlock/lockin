@@ -32,7 +32,7 @@ pub fn _query_from_read(r: NamespaceReadRequest) -> Query {
 pub fn namespace_response_from_command(r: CommandResponse) -> NamespaceResponse {
     match r {
         CommandResponse::OpenOk { node_id, metadata } => NamespaceResponse::OpenOk {
-            id: node_id.as_u64(), // or id.0 if pub
+            id: node_id.as_u64(),
             instance: metadata.instance,
             content_gen: metadata.content_gen,
         },

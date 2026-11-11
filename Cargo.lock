@@ -447,6 +447,7 @@ name = "lockin-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bincode-next",
  "bytes",
  "config",
@@ -459,6 +460,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
