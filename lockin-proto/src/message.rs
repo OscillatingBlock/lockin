@@ -48,7 +48,7 @@ pub enum LockinResponse {
     Error { code: ErrorCode, message: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NamespaceResponse {
     OpenOk {
         id: u64,
