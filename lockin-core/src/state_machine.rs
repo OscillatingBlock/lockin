@@ -4,7 +4,7 @@ use mini_raft::state_machine::StateMachine;
 use std::sync::Mutex;
 
 use crate::{
-    command::{Command, Query, QueryResponse},
+    command::{Command, CommandResponse, Query, QueryResponse},
     tree::Namespace,
 };
 
@@ -13,6 +13,12 @@ pub struct LockinStateMachine {
 }
 
 impl LockinStateMachine {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(Namespace::new()),
+        }
+    }
+
     pub fn apply_logs(&self, command: &bytes::Bytes) -> anyhow::Result<Bytes> {
         self.apply_log(command)
     }
@@ -39,8 +45,9 @@ impl StateMachine for LockinStateMachine {
         let (decoded_cmd, _): (Command, usize) =
             bincode_next::serde::decode_from_slice(command, config)
                 .context("failed to decode command into NamespaceCommand")?;
-        let response = self.inner.lock().unwrap().apply(decoded_cmd);
-        let out = bincode_next::serde::encode_to_vec(response, config)?;
+        let response = self.inner.lock().unwrap().apply(decoded_cmd)?;
+        let out = bincode_next::serde::encode_to_vec(&response, config)?;
+
         Ok(Bytes::from(out))
     }
 }
