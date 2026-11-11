@@ -37,7 +37,7 @@ pub enum QueryResponse {
     Error(String),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum CommandResponse {
     OpenOk { node_id: NodeId, metadata: Metadata },
     MkdirOk { node_id: NodeId, metadata: Metadata },
