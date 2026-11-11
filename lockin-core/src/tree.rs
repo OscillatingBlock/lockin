@@ -141,6 +141,7 @@ impl Namespace {
             path = %path_str,
             id = ?new_node.id,
             instance = new_node.metadata.instance,
+            content_gen = new_node.metadata.content_gen,
             "open: created new node"
         );
         Ok((new_node.id.clone(), new_node.metadata))
@@ -403,12 +404,13 @@ impl Namespace {
             }
         };
 
+        debug!(content_gen = ?new_node.metadata.content_gen, "content gen inside create new node method");
         self.next_id += 1;
         self.nodes.insert(new_node_id.clone(), new_node.clone());
         self.path_index
             .insert(name.to_string(), new_node_id.clone());
 
-        trace!(id = ?new_node_id, name = %name, "node inserted into nodes + path_index");
+        debug!(id = ?new_node_id, name = %name, "node inserted into nodes + path_index");
         new_node
     }
 
@@ -537,7 +539,10 @@ mod test {
     // -------------------------------------------------------------------------
 
     fn init_tracing() {
-        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
     }
 
     #[test]
