@@ -4,7 +4,7 @@ use mini_raft::state_machine::StateMachine;
 use std::sync::Mutex;
 
 use crate::{
-    command::{Command, CommandResponse, Query, QueryResponse},
+    command::{Command, Query, QueryResponse},
     tree::Namespace,
 };
 
