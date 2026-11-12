@@ -237,6 +237,28 @@ mod tests {
         server.try_namespace_write(req).await.unwrap()
     }
 
+    async fn open_test_dir(server: &LockinServer, path: &str) -> NamespaceResponse {
+        let req = NamespaceWriteRequest::Mkdir {
+            path: String::from(path),
+        };
+        server.try_namespace_write(req).await.unwrap()
+    }
+
+    async fn write_file(
+        server: &LockinServer,
+        id: u64,
+        expected_gen: u64,
+        data: Bytes,
+    ) -> NamespaceResponse {
+        let req = NamespaceWriteRequest::SetContents {
+            id: id,
+            expected_gen: expected_gen,
+            data: data,
+        };
+        println!("writing contents to file");
+        server.try_namespace_write(req).await.unwrap()
+    }
+
     #[tokio::test]
     async fn try_write_open() {
         let (server, _) = init_test(true);
@@ -345,5 +367,146 @@ mod tests {
 
         let response = server.try_namespace_write(write_req).await;
         assert!(response.is_err(), "expected proposal error when not leader");
+    }
+
+    #[tokio::test]
+    async fn test_try_read_after_set() {
+        let (server, _) = init_test(true);
+        open_test_file(&server, "/W").await;
+        write_file(&server, 1, 0, Bytes::from_static(b"data")).await;
+
+        let read_req = NamespaceReadRequest::GetContents { id: 1 };
+        let response = server.try_namespace_read(read_req).await.unwrap();
+        let NamespaceResponse::GetContentsOk {
+            data,
+            content_gen,
+            instance,
+        } = &response
+        else {
+            panic!("expected GetContentsOk type")
+        };
+        assert_eq!(data, &Bytes::from_static(b"data"));
+        assert_eq!(*content_gen, 1);
+        assert_eq!(*instance, 1);
+    }
+
+    #[tokio::test]
+    async fn test_try_read_missing() {
+        let (server, _) = init_test(true);
+        let read_req = NamespaceReadRequest::GetContents { id: 1 };
+        let response = server.try_namespace_read(read_req).await;
+        let Err(_) = response else {
+            panic!("expected error");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_read_directory() {
+        let (server, _) = init_test(true);
+        open_test_dir(&server, "/dir/").await;
+        let read_req = NamespaceReadRequest::GetContents { id: 1 };
+        let response = server.try_namespace_read(read_req).await;
+        let Err(_) = response else {
+            panic!("expected error");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_read_empty_file() {
+        let (server, _) = init_test(true);
+        open_test_file(&server, "/W").await;
+
+        let read_req = NamespaceReadRequest::GetContents { id: 1 };
+        let response = server.try_namespace_read(read_req).await.unwrap();
+        let NamespaceResponse::GetContentsOk {
+            data,
+            content_gen,
+            instance,
+        } = &response
+        else {
+            panic!("expected GetContentsOk type")
+        };
+        assert_eq!(data, &Bytes::from_static(b""));
+        assert_eq!(*content_gen, 0);
+        assert_eq!(*instance, 1);
+    }
+
+    #[tokio::test]
+    async fn test_write_sends_namespace_ok() {
+        let (server, mut rx) = init_test(true);
+        let open_req = NamespaceWriteRequest::Open {
+            path: String::from("/file"),
+            create: true,
+        };
+        server.write_namespace(1, open_req).await.unwrap();
+
+        let server_to_net = rx.recv().await.unwrap();
+        assert_eq!(server_to_net.conn_id, 1);
+        let Message::Response(response) = &server_to_net.msg else {
+            panic!("expected response");
+        };
+        let LockinResponse::Namespace(ns_response) = response else {
+            panic!("expected namespace response");
+        };
+        let NamespaceResponse::OpenOk {
+            id,
+            content_gen,
+            instance,
+        } = ns_response
+        else {
+            panic!("expected namespace response open ok");
+        };
+        assert_eq!(*id, 1);
+        assert_eq!(*content_gen, 0);
+        assert_eq!(*instance, 1);
+    }
+
+    #[tokio::test]
+    async fn test_write_sends_not_leader() {
+        let (server, mut rx) = init_test(false);
+        let open_req = NamespaceWriteRequest::Open {
+            path: String::from("/file"),
+            create: true,
+        };
+        server.write_namespace(1, open_req).await.unwrap();
+
+        let server_to_net = rx.recv().await.unwrap();
+        assert_eq!(server_to_net.conn_id, 1);
+        let Message::Response(response) = &server_to_net.msg else {
+            panic!("expected response");
+        };
+        let LockinResponse::NotLeader { leader_hint: _ } = response else {
+            panic!("expected Not Leader response");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_read_sends_namespace_ok() {
+        let (server, mut rx) = init_test(true);
+        open_test_file(&server, "/W").await;
+        write_file(&server, 1, 0, Bytes::from_static(b"data")).await;
+
+        let read_req = NamespaceReadRequest::GetContents { id: 1 };
+        server.read_namespace(1, read_req).await.unwrap();
+
+        let server_msg = rx.recv().await.unwrap();
+        let Message::Response(response) = &server_msg.msg else {
+            panic!("expected response");
+        };
+        let LockinResponse::Namespace(ns_response) = response else {
+            panic!("expected namespace response");
+        };
+
+        let NamespaceResponse::GetContentsOk {
+            data,
+            content_gen,
+            instance,
+        } = ns_response
+        else {
+            panic!("expected get content type response");
+        };
+        assert_eq!(*data, Bytes::from_static(b"data"));
+        assert_eq!(*content_gen, 1);
+        assert_eq!(*instance, 1);
     }
 }
