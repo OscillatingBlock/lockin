@@ -12,7 +12,6 @@ pub struct Config {
 #[derive(Deserialize)]
 struct LockinConfig {
     client_listener_address: String,
-    node_id: u64,
 }
 
 impl Config {
