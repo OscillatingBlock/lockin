@@ -9,6 +9,7 @@ pub enum Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LockinRequest {
     Namespace(NamespaceRequest),
+    Session(SessionRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ pub enum NamespaceReadRequest {
 pub enum LockinResponse {
     Namespace(NamespaceResponse),
     NotLeader { leader_hint: Option<String> },
+    Session(SessionResponse),
     Error { code: ErrorCode, message: String },
 }
 
@@ -85,4 +87,24 @@ pub enum ErrorCode {
     InvalidPath,
     CannotDeleteRoot,
     Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SessionRequest {
+    Create,
+    KeepAlive { session_id: u64 },
+    Close { session_id: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SessionResponse {
+    CreateOk {
+        session_id: u64,
+        lease_timeout_ms: u64,
+    },
+    KeepAliveOk {
+        session_id: u64,
+        lease_timeout_ms: u64,
+    },
+    KeepAliveExpired,
 }

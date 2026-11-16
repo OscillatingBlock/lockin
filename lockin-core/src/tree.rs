@@ -8,7 +8,7 @@ use tracing::{debug, error, info, trace, warn};
 const MAX_FILE_SIZE: u64 = 256 * 1024;
 
 use crate::{
-    command::{Command, CommandResponse},
+    command::{CommandResponse, NamespaceCommand},
     node::{Metadata, Node, NodeId, NodeKind, NodeName},
 };
 
@@ -57,6 +57,9 @@ pub enum NamespaceError {
 
     #[error("internal server error")]
     Internal,
+
+    #[error("Not a valid Namespace command")]
+    NotNamespaceCommand,
 }
 
 impl Namespace {
@@ -306,20 +309,20 @@ impl Namespace {
         Ok(())
     }
 
-    pub fn apply(&mut self, cmd: Command) -> Result<CommandResponse, NamespaceError> {
+    pub fn apply(&mut self, cmd: NamespaceCommand) -> Result<CommandResponse, NamespaceError> {
         match cmd {
-            Command::Open { path, create } => match self.open(path.as_str(), create) {
+            NamespaceCommand::Open { path, create } => match self.open(path.as_str(), create) {
                 Ok((id, meta)) => Ok(CommandResponse::OpenOk {
                     node_id: id,
                     metadata: meta,
                 }),
                 Err(e) => Err(e.into()),
             },
-            Command::Mkdir { path } => match self.mkdir(path.as_str()) {
+            NamespaceCommand::Mkdir { path } => match self.mkdir(path.as_str()) {
                 Ok((node_id, metadata)) => Ok(CommandResponse::MkdirOk { node_id, metadata }),
                 Err(e) => Err(e.into()),
             },
-            Command::SetContents {
+            NamespaceCommand::SetContents {
                 id,
                 expected_gen,
                 data,
@@ -327,7 +330,7 @@ impl Namespace {
                 Ok(metadata) => Ok(CommandResponse::SetContentsOk { metadata }),
                 Err(e) => Err(e.into()),
             },
-            Command::Delete { id } => match self.delete(id) {
+            NamespaceCommand::Delete { id } => match self.delete(id) {
                 Ok(()) => Ok(CommandResponse::DeleteOK),
                 Err(e) => Err(e.into()),
             },

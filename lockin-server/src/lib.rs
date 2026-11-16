@@ -3,6 +3,7 @@ pub mod config;
 mod convert;
 pub mod error;
 pub mod handler;
+pub mod lease_store;
 pub mod net;
 pub mod server;
 

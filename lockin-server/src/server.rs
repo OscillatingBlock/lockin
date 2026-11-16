@@ -2,21 +2,27 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lockin_core::{
-    command::{CommandResponse, Query},
-    node::NodeId,
-    state_machine::LockinStateMachine,
+    command::CommandResponse, node::NodeId, session::SessionId, state_machine::LockinStateMachine,
 };
 use lockin_proto::message::{
     ErrorCode, LockinRequest, LockinResponse, Message, NamespaceReadRequest, NamespaceRequest,
-    NamespaceResponse, NamespaceWriteRequest,
+    NamespaceResponse, NamespaceWriteRequest, SessionRequest, SessionResponse,
 };
 use mini_raft::server::RaftNode;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
-    convert::{command_from_write, namespace_response_from_command, namespace_response_from_query},
+    convert::{
+        command_create_session, command_expire_session, command_from_write,
+        namespace_response_from_command, namespace_response_from_query,
+        session_create_ok_from_response, session_expire_ok_from_response,
+    },
+    lease_store::LeaderLeaseTable,
     net::{ConnectionId, NetToServer, ServerToNet},
 };
 
@@ -24,6 +30,7 @@ pub struct LockinServer {
     state_machine: Arc<LockinStateMachine>,
     raft_node: Arc<dyn RaftNodeTrait>,
     to_net: mpsc::Sender<ServerToNet>,
+    lease_store: LeaderLeaseTable,
 }
 
 #[async_trait]
@@ -52,6 +59,7 @@ impl LockinServer {
             state_machine,
             raft_node,
             to_net,
+            lease_store: LeaderLeaseTable::new(12000, 4000),
         }
     }
 
@@ -86,6 +94,21 @@ impl LockinServer {
                     .read_namespace(id, ns_read_req)
                     .await
                     .context("failed to handle namespace read request"),
+            },
+
+            LockinRequest::Session(sess) => match sess {
+                SessionRequest::Create => self
+                    .create_session(id)
+                    .await
+                    .context("failed to create session"),
+                SessionRequest::KeepAlive { session_id } => self
+                    .keep_alive(id, session_id)
+                    .await
+                    .context("failed to handle keep alive request"),
+                SessionRequest::Close { session_id } => self
+                    .close_session(id, session_id)
+                    .await
+                    .context("failed to close session"),
             },
         }
     }
@@ -133,7 +156,10 @@ impl LockinServer {
                         bincode_next::config::standard(),
                     )
                     .context("failed to decode CommandResponse from raft")?;
-                Ok(namespace_response_from_command(cmd_resp))
+                let Ok(ns_res) = namespace_response_from_command(cmd_resp) else {
+                    anyhow::bail!("expected namespace response");
+                };
+                Ok(ns_res)
             }
             Err(e) => Err(e),
         }
@@ -166,34 +192,174 @@ impl LockinServer {
         &self,
         read_req: NamespaceReadRequest,
     ) -> anyhow::Result<NamespaceResponse> {
-        let parsed_req = match read_req {
-            NamespaceReadRequest::GetContents { id } => Query::GetContents {
-                id: NodeId::new(id),
-            },
+        let node_id = match read_req {
+            NamespaceReadRequest::GetContents { id } => NodeId::new(id),
         };
 
-        let query_response = self
+        let (bytes, metadata) = self
             .state_machine
-            .read_state(parsed_req)
+            .get_content(node_id)
             .context("failed to read namespace state")?;
-        Ok(namespace_response_from_query(query_response))
+        Ok(namespace_response_from_query(bytes, metadata))
+    }
+
+    async fn create_session(&self, conn_id: ConnectionId) -> anyhow::Result<()> {
+        let msg = match self.try_create_session().await {
+            Ok(sess_res) => Message::Response(LockinResponse::Session(sess_res)),
+            Err(e) => match self.raft_node.is_leader() {
+                true => Message::Response(LockinResponse::Error {
+                    code: ErrorCode::Internal,
+                    message: e.to_string(),
+                }),
+                false => Message::Response(LockinResponse::NotLeader { leader_hint: None }),
+            },
+        };
+        self.to_net
+            .send(ServerToNet { conn_id, msg })
+            .await
+            .context("failed to send response to client")
+    }
+
+    async fn try_create_session(&self) -> anyhow::Result<SessionResponse> {
+        if !self.raft_node.is_leader() {
+            anyhow::bail!("not leader")
+        }
+        let cmd = command_create_session();
+        let cmd_bytes = bincode_next::serde::encode_to_vec(&cmd, bincode_next::config::standard())
+            .context("failed to serialize command")?;
+
+        match self.raft_node.propose(Bytes::from(cmd_bytes)).await {
+            Ok(slice) => {
+                let (cmd_resp, _): (CommandResponse, usize) =
+                    bincode_next::serde::decode_from_slice(
+                        &slice,
+                        bincode_next::config::standard(),
+                    )
+                    .context("failed to decode CommandResponse from raft")?;
+
+                let CommandResponse::CreateSessionOk { session_id } = &cmd_resp else {
+                    anyhow::bail!("exptected CreateSessionOK, failed to create session")
+                };
+                let lease_timeout_ms = self.lease_store.renew_lease(&session_id);
+                session_create_ok_from_response(cmd_resp, lease_timeout_ms)
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
+    async fn keep_alive(&self, conn_id: ConnectionId, session_id: u64) -> anyhow::Result<()> {
+        let msg = match self.try_keep_alive(SessionId::from_u64(session_id)).await {
+            Ok(msg) => Message::Response(LockinResponse::Session(msg)),
+            Err(e) => Message::Response(LockinResponse::Error {
+                code: ErrorCode::Internal,
+                message: e.to_string(),
+            }),
+        };
+        self.to_net
+            .send(ServerToNet { conn_id, msg })
+            .await
+            .context("failed to send response to client")
+    }
+
+    async fn try_keep_alive(&self, session_id: SessionId) -> anyhow::Result<SessionResponse> {
+        if !self.raft_node.is_leader() {
+            anyhow::bail!("not leader");
+        }
+
+        if !self.state_machine.session_exists(&session_id) {
+            warn!("session not present in session store, expired session");
+            return Ok(SessionResponse::KeepAliveExpired);
+        }
+
+        debug!("calling expires in ");
+        let expires_at =
+            Instant::now() + Duration::from_millis(self.lease_store.expires_in_ms(&session_id));
+        debug!("expires in expires_in_ms");
+        if Instant::now() >= expires_at {
+            debug!("expired session");
+            let msg = self.propose_expire_session(&session_id).await;
+            self.lease_store
+                .remove(&session_id)
+                .context("failed to remove lease from lease store")?;
+            return msg;
+        } else {
+            debug!("sleeping");
+            tokio::time::sleep_until(tokio::time::Instant::from_std(
+                expires_at - Duration::from_millis(self.lease_store.slack_duration_ms),
+            ))
+            .await;
+        }
+
+        let new_expires_at = self.lease_store.renew_lease(&session_id);
+        Ok(SessionResponse::KeepAliveOk {
+            session_id: session_id.as_u64(),
+            lease_timeout_ms: new_expires_at,
+        })
+    }
+
+    async fn propose_expire_session(
+        &self,
+        session_id: &SessionId,
+    ) -> anyhow::Result<SessionResponse> {
+        let cmd = command_expire_session(session_id.clone());
+        let cmd_bytes = bincode_next::serde::encode_to_vec(&cmd, bincode_next::config::standard())
+            .context("failed to serialize command")?;
+
+        match self.raft_node.propose(Bytes::from(cmd_bytes)).await {
+            Ok(slice) => {
+                let (cmd_resp, _): (CommandResponse, usize) =
+                    bincode_next::serde::decode_from_slice(
+                        &slice,
+                        bincode_next::config::standard(),
+                    )
+                    .context("failed to decode CommandResponse from raft")?;
+                session_expire_ok_from_response(cmd_resp)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn close_session(&self, conn_id: ConnectionId, session_id: u64) -> anyhow::Result<()> {
+        let response = self
+            .try_close_session(SessionId::from_u64(session_id))
+            .await;
+        let msg = match response {
+            Ok(msg) => Message::Response(LockinResponse::Session(msg)),
+            Err(e) => Message::Response(LockinResponse::Error {
+                code: ErrorCode::Internal,
+                message: e.to_string(),
+            }),
+        };
+        self.to_net
+            .send(ServerToNet { conn_id, msg })
+            .await
+            .context("failed to send response to client")
+    }
+
+    async fn try_close_session(&self, session_id: SessionId) -> anyhow::Result<SessionResponse> {
+        self.propose_expire_session(&session_id).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing::debug;
+
     use super::*;
 
     struct MockRaftNode {
         state_machine: Arc<LockinStateMachine>,
-        is_leader: bool,
+        is_leader: AtomicBool,
     }
 
     impl MockRaftNode {
         fn new(state_machine: Arc<LockinStateMachine>, is_leader: bool) -> Self {
             Self {
                 state_machine,
-                is_leader,
+                is_leader: AtomicBool::new(is_leader),
             }
         }
     }
@@ -201,15 +367,21 @@ mod tests {
     #[async_trait]
     impl RaftNodeTrait for MockRaftNode {
         fn is_leader(&self) -> bool {
-            self.is_leader
+            self.is_leader.load(Ordering::SeqCst)
         }
 
         async fn propose(&self, command: bytes::Bytes) -> anyhow::Result<Bytes> {
-            if self.is_leader {
+            if self.is_leader.load(Ordering::SeqCst) {
                 self.state_machine.apply_logs(&command)
             } else {
                 anyhow::bail!("not leader");
             }
+        }
+    }
+
+    impl MockRaftNode {
+        fn set_leader(&self, state: bool) {
+            self.is_leader.store(state, Ordering::SeqCst);
         }
     }
 
@@ -226,6 +398,23 @@ mod tests {
 
         let server = LockinServer::new(state_machine, Arc::new(raft_node), to_net);
         (server, from_server)
+    }
+
+    fn init_test_mut(
+        is_leader: bool,
+    ) -> (LockinServer, mpsc::Receiver<ServerToNet>, Arc<MockRaftNode>) {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+
+        let state_machine = Arc::new(LockinStateMachine::new());
+        let (to_net, from_server) = mpsc::channel::<ServerToNet>(100);
+        let raft_node = MockRaftNode::new(Arc::clone(&state_machine), is_leader);
+        let raft_node_clone = Arc::new(raft_node);
+
+        let server = LockinServer::new(state_machine, raft_node_clone.clone(), to_net);
+        (server, from_server, raft_node_clone.clone())
     }
 
     /// Helper to quickly set up an open file for tests that need an existing ID
@@ -509,4 +698,216 @@ mod tests {
         assert_eq!(*content_gen, 1);
         assert_eq!(*instance, 1);
     }
+
+    #[tokio::test]
+    async fn test_try_create_session() {
+        let (server, _) = init_test(true);
+
+        let res = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms,
+        } = res
+        else {
+            panic!("expected no error");
+        };
+
+        assert_eq!(session_id, 0);
+        assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
+    }
+
+    #[tokio::test]
+    async fn test_try_create_session_not_leader() {
+        let (server, _) = init_test(false);
+
+        let res = server.try_create_session().await;
+        let Err(_) = res else {
+            panic!("expected error")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_create_two_session_distinct_id() {
+        let (server, _) = init_test(true);
+
+        let sess1 = server.try_create_session().await.unwrap();
+        let sess2 = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id: session_id_1,
+            lease_timeout_ms: _,
+        } = sess1
+        else {
+            panic!("exptected CreateOk type")
+        };
+        let SessionResponse::CreateOk {
+            session_id: session_id_2,
+            lease_timeout_ms: _,
+        } = sess2
+        else {
+            panic!("exptected CreateOk type")
+        };
+        assert_ne!(session_id_1, session_id_2);
+    }
+
+    #[tokio::test]
+    async fn test_try_keep_alive_ok() {
+        let (server, _) = init_test(true);
+
+        let sess = server.try_create_session().await.unwrap();
+
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        let lease = server
+            .try_keep_alive(SessionId::from_u64(session_id))
+            .await
+            .unwrap();
+
+        let SessionResponse::KeepAliveOk {
+            session_id: keep_alive_sess_id,
+            lease_timeout_ms,
+        } = lease
+        else {
+            panic!("exptected KeepAliveOk");
+        };
+
+        assert_eq!(session_id, keep_alive_sess_id);
+        assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
+    }
+
+    #[tokio::test]
+    async fn test_try_keep_alive_unknown_session() {
+        let (server, _) = init_test(true);
+        let response = server
+            .try_keep_alive(SessionId::from_u64(67))
+            .await
+            .unwrap();
+        let SessionResponse::KeepAliveExpired = response else {
+            panic!("expected KeepAliveExpired");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_keep_alive_after_close() {
+        let (server, _) = init_test(true);
+
+        let sess = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        let sess_id = SessionId::from_u64(session_id);
+        server.try_close_session(sess_id.clone()).await.unwrap();
+
+        let response = server.try_keep_alive(sess_id).await.unwrap();
+        let SessionResponse::KeepAliveExpired = response else {
+            panic!("expected KeepAliveExpired");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_keep_alive_after_expire() {
+        let (server, _) = init_test(true);
+
+        let sess = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        let sess_id = SessionId::from_u64(session_id);
+        server.propose_expire_session(&sess_id).await.unwrap();
+
+        let response = server.try_keep_alive(sess_id).await.unwrap();
+        let SessionResponse::KeepAliveExpired = response else {
+            panic!("expected KeepAliveExpired");
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_keep_alive_not_leader() {
+        let (server, _, raft_node) = init_test_mut(true);
+
+        let sess = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        raft_node.set_leader(false);
+        let res = server.try_keep_alive(SessionId::from_u64(session_id)).await;
+        let Err(_) = res else {
+            panic!("expected error")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_keep_alive_rearms_missing_lease() {
+        let (server, _) = init_test(true);
+
+        let sess = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        let sess_id = SessionId::from_u64(session_id);
+        server.lease_store.remove(&sess_id).unwrap();
+
+        debug!("calling keep alive");
+        let response = server.try_keep_alive(sess_id.clone()).await.unwrap();
+        let SessionResponse::KeepAliveOk {
+            session_id,
+            lease_timeout_ms,
+        } = response
+        else {
+            panic!("exptected KeepAliveOk type")
+        };
+
+        assert_eq!(session_id, sess_id.as_u64());
+        assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
+    }
+
+    #[tokio::test]
+    async fn test_expire_existing_session() {
+        let (server, _) = init_test(true);
+
+        let sess = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        let sid = SessionId::from_u64(session_id);
+        let response = server.propose_expire_session(&sid).await.unwrap();
+
+        let SessionResponse::KeepAliveExpired = response else {
+            panic!("expected KeepAliveExpired type")
+        };
+    }
+
+    #[tokio::test]
+    //TODO:
+    async fn test_expire_missing_session() {}
 }
