@@ -417,6 +417,19 @@ mod tests {
         (server, from_server, raft_node_clone.clone())
     }
 
+    async fn create_session(server: &LockinServer) -> SessionId {
+        let sess = server.try_create_session().await.unwrap();
+        let SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms: _,
+        } = sess
+        else {
+            panic!("exptected CreateOk type")
+        };
+
+        SessionId::from_u64(session_id)
+    }
+
     /// Helper to quickly set up an open file for tests that need an existing ID
     async fn open_test_file(server: &LockinServer, path: &str) -> NamespaceResponse {
         let req = NamespaceWriteRequest::Open {
@@ -730,43 +743,17 @@ mod tests {
     async fn test_try_create_two_session_distinct_id() {
         let (server, _) = init_test(true);
 
-        let sess1 = server.try_create_session().await.unwrap();
-        let sess2 = server.try_create_session().await.unwrap();
-        let SessionResponse::CreateOk {
-            session_id: session_id_1,
-            lease_timeout_ms: _,
-        } = sess1
-        else {
-            panic!("exptected CreateOk type")
-        };
-        let SessionResponse::CreateOk {
-            session_id: session_id_2,
-            lease_timeout_ms: _,
-        } = sess2
-        else {
-            panic!("exptected CreateOk type")
-        };
-        assert_ne!(session_id_1, session_id_2);
+        let sid1 = create_session(&server).await;
+        let sid2 = create_session(&server).await;
+        assert_ne!(sid1, sid2);
     }
 
     #[tokio::test]
     async fn test_try_keep_alive_ok() {
         let (server, _) = init_test(true);
 
-        let sess = server.try_create_session().await.unwrap();
-
-        let SessionResponse::CreateOk {
-            session_id,
-            lease_timeout_ms: _,
-        } = sess
-        else {
-            panic!("exptected CreateOk type")
-        };
-
-        let lease = server
-            .try_keep_alive(SessionId::from_u64(session_id))
-            .await
-            .unwrap();
+        let sid = create_session(&server).await;
+        let lease = server.try_keep_alive(sid.clone()).await.unwrap();
 
         let SessionResponse::KeepAliveOk {
             session_id: keep_alive_sess_id,
@@ -776,7 +763,7 @@ mod tests {
             panic!("exptected KeepAliveOk");
         };
 
-        assert_eq!(session_id, keep_alive_sess_id);
+        assert_eq!(sid.as_u64(), keep_alive_sess_id);
         assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
     }
 
@@ -796,16 +783,7 @@ mod tests {
     async fn test_try_keep_alive_after_close() {
         let (server, _) = init_test(true);
 
-        let sess = server.try_create_session().await.unwrap();
-        let SessionResponse::CreateOk {
-            session_id,
-            lease_timeout_ms: _,
-        } = sess
-        else {
-            panic!("exptected CreateOk type")
-        };
-
-        let sess_id = SessionId::from_u64(session_id);
+        let sess_id = create_session(&server).await;
         server.try_close_session(sess_id.clone()).await.unwrap();
 
         let response = server.try_keep_alive(sess_id).await.unwrap();
@@ -818,19 +796,10 @@ mod tests {
     async fn test_try_keep_alive_after_expire() {
         let (server, _) = init_test(true);
 
-        let sess = server.try_create_session().await.unwrap();
-        let SessionResponse::CreateOk {
-            session_id,
-            lease_timeout_ms: _,
-        } = sess
-        else {
-            panic!("exptected CreateOk type")
-        };
+        let sid = create_session(&server).await;
+        server.propose_expire_session(&sid).await.unwrap();
 
-        let sess_id = SessionId::from_u64(session_id);
-        server.propose_expire_session(&sess_id).await.unwrap();
-
-        let response = server.try_keep_alive(sess_id).await.unwrap();
+        let response = server.try_keep_alive(sid).await.unwrap();
         let SessionResponse::KeepAliveExpired = response else {
             panic!("expected KeepAliveExpired");
         };
@@ -840,17 +809,9 @@ mod tests {
     async fn test_try_keep_alive_not_leader() {
         let (server, _, raft_node) = init_test_mut(true);
 
-        let sess = server.try_create_session().await.unwrap();
-        let SessionResponse::CreateOk {
-            session_id,
-            lease_timeout_ms: _,
-        } = sess
-        else {
-            panic!("exptected CreateOk type")
-        };
-
+        let sid = create_session(&server).await;
         raft_node.set_leader(false);
-        let res = server.try_keep_alive(SessionId::from_u64(session_id)).await;
+        let res = server.try_keep_alive(sid).await;
         let Err(_) = res else {
             panic!("expected error")
         };
@@ -860,16 +821,7 @@ mod tests {
     async fn test_try_keep_alive_rearms_missing_lease() {
         let (server, _) = init_test(true);
 
-        let sess = server.try_create_session().await.unwrap();
-        let SessionResponse::CreateOk {
-            session_id,
-            lease_timeout_ms: _,
-        } = sess
-        else {
-            panic!("exptected CreateOk type")
-        };
-
-        let sess_id = SessionId::from_u64(session_id);
+        let sess_id = create_session(&server).await;
         server.lease_store.remove(&sess_id).unwrap();
 
         debug!("calling keep alive");
@@ -890,16 +842,7 @@ mod tests {
     async fn test_expire_existing_session() {
         let (server, _) = init_test(true);
 
-        let sess = server.try_create_session().await.unwrap();
-        let SessionResponse::CreateOk {
-            session_id,
-            lease_timeout_ms: _,
-        } = sess
-        else {
-            panic!("exptected CreateOk type")
-        };
-
-        let sid = SessionId::from_u64(session_id);
+        let sid = create_session(&server).await;
         let response = server.propose_expire_session(&sid).await.unwrap();
 
         let SessionResponse::KeepAliveExpired = response else {
