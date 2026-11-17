@@ -252,10 +252,16 @@ impl LockinServer {
     async fn keep_alive(&self, conn_id: ConnectionId, session_id: u64) -> anyhow::Result<()> {
         let msg = match self.try_keep_alive(SessionId::from_u64(session_id)).await {
             Ok(msg) => Message::Response(LockinResponse::Session(msg)),
-            Err(e) => Message::Response(LockinResponse::Error {
-                code: ErrorCode::Internal,
-                message: e.to_string(),
-            }),
+            Err(e) => {
+                if self.raft_node.is_leader() {
+                    Message::Response(LockinResponse::NotLeader { leader_hint: None })
+                } else {
+                    Message::Response(LockinResponse::Error {
+                        code: ErrorCode::Internal,
+                        message: e.to_string(),
+                    })
+                }
+            }
         };
         self.to_net
             .send(ServerToNet { conn_id, msg })
@@ -327,11 +333,18 @@ impl LockinServer {
             .await;
         let msg = match response {
             Ok(msg) => Message::Response(LockinResponse::Session(msg)),
-            Err(e) => Message::Response(LockinResponse::Error {
-                code: ErrorCode::Internal,
-                message: e.to_string(),
-            }),
+            Err(e) => {
+                if self.raft_node.is_leader() {
+                    Message::Response(LockinResponse::NotLeader { leader_hint: None })
+                } else {
+                    Message::Response(LockinResponse::Error {
+                        code: ErrorCode::Internal,
+                        message: e.to_string(),
+                    })
+                }
+            }
         };
+
         self.to_net
             .send(ServerToNet { conn_id, msg })
             .await
@@ -845,12 +858,181 @@ mod tests {
         let sid = create_session(&server).await;
         let response = server.propose_expire_session(&sid).await.unwrap();
 
-        let SessionResponse::KeepAliveExpired = response else {
+        let SessionResponse::ExpireOk = response else {
             panic!("expected KeepAliveExpired type")
         };
     }
 
     #[tokio::test]
-    //TODO:
-    async fn test_expire_missing_session() {}
+    async fn test_expire_missing_session() {
+        let (server, _) = init_test(true);
+
+        let sid = SessionId::from_u64(67);
+        let result = server.propose_expire_session(&sid).await;
+
+        let Err(_) = result else {
+            panic!("expected Err")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_expire_not_leader() {
+        let (server, _, raft_node) = init_test_mut(true);
+        let sid = create_session(&server).await;
+
+        raft_node.set_leader(false);
+        let result = server.propose_expire_session(&sid).await;
+
+        let Err(_) = result else {
+            panic!("expected Err")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_close_ok() {
+        let (server, _) = init_test(true);
+
+        let sid = create_session(&server).await;
+        let response = server.try_close_session(sid.clone()).await.unwrap();
+        let SessionResponse::ExpireOk = response else {
+            panic!("expected SessionResponse::ExpireOk type")
+        };
+
+        let response = server.try_keep_alive(sid).await.unwrap();
+        let SessionResponse::KeepAliveExpired = response else {
+            panic!("expected keep alive expired")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_try_close_unknown() {
+        let (server, _) = init_test(true);
+
+        let sid = SessionId::from_u64(67);
+        let result = server.try_close_session(sid.clone()).await;
+        let Err(_) = result else {
+            panic!("expected Err")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_create_session_sends_ok() {
+        let (server, mut rx) = init_test(true);
+
+        server.create_session(1).await.unwrap();
+        let Some(ServerToNet { conn_id, msg }) = rx.recv().await else {
+            panic!("expected server_to_net type response")
+        };
+
+        assert_eq!(conn_id, 1);
+        let Message::Response(LockinResponse::Session(SessionResponse::CreateOk {
+            session_id,
+            lease_timeout_ms,
+        })) = msg
+        else {
+            panic!("expected CreateOk type")
+        };
+        assert_eq!(session_id, 0);
+        assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_sends_not_leader() {
+        let (server, mut rx) = init_test(false);
+
+        server.create_session(1).await.unwrap();
+        let Some(ServerToNet { conn_id, msg }) = rx.recv().await else {
+            panic!("expected server_to_net type response")
+        };
+
+        assert_eq!(conn_id, 1);
+        let Message::Response(LockinResponse::NotLeader { leader_hint: _ }) = msg else {
+            panic!("expected NotLeader type response")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_keep_alive_sends_ok() {
+        let (server, mut rx) = init_test(true);
+
+        let sid = create_session(&server).await;
+        server.keep_alive(1, sid.as_u64()).await.unwrap();
+        let Some(ServerToNet { conn_id, msg }) = rx.recv().await else {
+            panic!("expected server_to_net type response")
+        };
+
+        assert_eq!(conn_id, 1);
+        let Message::Response(LockinResponse::Session(SessionResponse::KeepAliveOk {
+            session_id,
+            lease_timeout_ms,
+        })) = msg
+        else {
+            panic!("expected KeepAliveOk type response")
+        };
+
+        assert_eq!(session_id, 0);
+        assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
+    }
+
+    #[tokio::test]
+    async fn test_keep_alive_sends_expired() {
+        let (server, mut rx) = init_test(true);
+
+        let sid = 9999;
+        server.keep_alive(1, sid).await.unwrap();
+        let Some(ServerToNet { conn_id, msg }) = rx.recv().await else {
+            panic!("expected server_to_net type response")
+        };
+
+        assert_eq!(conn_id, 1);
+        let Message::Response(LockinResponse::Session(SessionResponse::KeepAliveExpired)) = msg
+        else {
+            panic!("expected KeepAliveExpired type response")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_close_session_sends_ok() {
+        let (server, mut rx) = init_test(true);
+
+        let sid = create_session(&server).await;
+
+        server.close_session(1, sid.as_u64()).await.unwrap();
+        let Some(ServerToNet { conn_id, msg }) = rx.recv().await else {
+            panic!("expected server_to_net type response")
+        };
+
+        assert_eq!(conn_id, 1);
+        let Message::Response(LockinResponse::Session(SessionResponse::ExpireOk)) = msg else {
+            panic!("expected CloseOK type response")
+        };
+    }
+
+    #[tokio::test]
+    async fn test_create_keepalive_close_lifecycle() {
+        let (server, _) = init_test(true);
+
+        let sid = create_session(&server).await;
+        let response = server.try_keep_alive(sid.clone()).await.unwrap();
+
+        let SessionResponse::KeepAliveOk {
+            session_id,
+            lease_timeout_ms,
+        } = response
+        else {
+            panic!("expected KeepAliveOk")
+        };
+        assert_eq!(session_id, sid.as_u64());
+        assert!(lease_timeout_ms > server.lease_store.lease_duration_ms - 500);
+
+        let response = server.try_close_session(sid.clone()).await.unwrap();
+        let SessionResponse::ExpireOk = response else {
+            panic!("expected ExpireOk")
+        };
+
+        let response = server.try_keep_alive(sid.clone()).await.unwrap();
+        let SessionResponse::KeepAliveExpired = response else {
+            panic!("expected KeepAliveExpired")
+        };
+    }
 }

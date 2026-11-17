@@ -81,7 +81,7 @@ pub fn session_create_ok_from_response(
 
 pub fn session_expire_ok_from_response(r: CommandResponse) -> anyhow::Result<SessionResponse> {
     match r {
-        CommandResponse::ExpireSessionOk => Ok(SessionResponse::KeepAliveExpired),
+        CommandResponse::ExpireSessionOk => Ok(SessionResponse::ExpireOk),
         _ => anyhow::bail!("not an ExpireSessionOk CommandResponse"),
     }
 }

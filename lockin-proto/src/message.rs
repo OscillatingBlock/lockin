@@ -107,4 +107,5 @@ pub enum SessionResponse {
         lease_timeout_ms: u64,
     },
     KeepAliveExpired,
+    ExpireOk,
 }
